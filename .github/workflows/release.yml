@@ -36,17 +36,65 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push plugin images (on amd64 only)
+      - name: Show git version
+        shell: bash
         run: |
-          base_image="ghcr.io/${{ github.repository }}"
+          git describe --tags --always --dirty=-modified || echo "No git version available"
 
-          docker build -t $base_image:${{ github.ref_name }} -t $base_image:latest .
+      - name: Build and push plugin image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
 
-          docker push $base_image:${{ github.ref_name }}
-          docker push $base_image:latest
+      - name: Sign image by digest
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          cosign sign --yes $base_image:${{ github.ref_name }}
-          cosign sign --yes $base_image:latest
+          DIGEST="${{ steps.build.outputs.digest }}"
+          IMAGE="ghcr.io/${{ github.repository }}"
+
+          echo "Signing ${IMAGE}@${DIGEST}"
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+          echo "IMAGE_DIGEST=${DIGEST}" >> $GITHUB_ENV
+
+      - name: Write release notes (with immutable digest)
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${{ github.ref_name }}"
+          IMAGE="ghcr.io/${{ github.repository }}"
+          TAG_DIGEST="${{ env.IMAGE_DIGEST }}"
+
+          cat > release-body.md <<EOF
+          Final release for \`${TAG}\`.
+
+          Included:
+          - Plugin image: \`${IMAGE}:${TAG}\`
+
+          ✅ Immutable digest (recommended for pinning):
+          - \`${IMAGE}@${TAG_DIGEST}\`
+
+          All container images are signed with Cosign. Verify with:
+
+          \`\`\`bash
+          cosign verify \
+            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${TAG}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ${IMAGE}@${TAG_DIGEST}
+          \`\`\`
+          EOF
+
+          echo "body_path=release-body.md" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
@@ -56,17 +104,5 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
-          body: |
-            Final release for `${{ github.ref_name }}`.
-
-            Included:
-            - Plugin image: `ghcr.io/${{ github.repository }}:${{ github.ref_name }}`
-
-            All container images are signed with Cosign. Verify with:
-
-            ```bash
-            cosign verify \
-              --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}" \
-              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-              ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ```
+          preserve_order: true
+          body_path: ${{ steps.notes.outputs.body_path }}
